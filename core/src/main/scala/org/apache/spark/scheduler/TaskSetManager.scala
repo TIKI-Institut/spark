@@ -286,7 +286,7 @@ private[spark] class TaskSetManager(
    * This method also cleans up any tasks in the list that have already
    * been launched, since we want that to happen lazily.
    */
-  private def dequeueTaskFromList(
+  protected def dequeueTaskFromList(
       execId: String,
       host: String,
       list: ArrayBuffer[Int],

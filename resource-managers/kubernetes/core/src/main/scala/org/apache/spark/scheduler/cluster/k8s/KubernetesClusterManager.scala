@@ -19,23 +19,184 @@ package org.apache.spark.scheduler.cluster.k8s
 import java.io.File
 import java.util.concurrent.TimeUnit
 
+import scala.collection.mutable.ArrayBuffer
+
+import collection.JavaConverters._
 import com.google.common.cache.CacheBuilder
-import io.fabric8.kubernetes.client.Config
+import com.google.common.net.InetAddresses
+import io.fabric8.kubernetes.api.model.Pod
+import io.fabric8.kubernetes.client.{Config, DefaultKubernetesClient, KubernetesClient}
 
 import org.apache.spark.SparkContext
 import org.apache.spark.deploy.k8s.{KubernetesConf, KubernetesUtils, SparkKubernetesClientFactory}
 import org.apache.spark.deploy.k8s.Config._
-import org.apache.spark.deploy.k8s.Constants.DEFAULT_EXECUTOR_CONTAINER_NAME
+import org.apache.spark.deploy.k8s.Constants._
 import org.apache.spark.internal.Logging
-import org.apache.spark.scheduler.{ExternalClusterManager, SchedulerBackend, TaskScheduler, TaskSchedulerImpl}
+import org.apache.spark.scheduler.{ExecutorCacheTaskLocation, ExternalClusterManager, HDFSCacheTaskLocation, SchedulerBackend, TaskLocality, TaskScheduler, TaskSchedulerImpl, TaskSet, TaskSetManager}
 import org.apache.spark.util.{SystemClock, ThreadUtils}
 
 private[spark] class KubernetesClusterManager extends ExternalClusterManager with Logging {
 
+  private def emptyTasks = ArrayBuffer.empty[Int]
+
   override def canCreate(masterURL: String): Boolean = masterURL.startsWith("k8s")
 
   override def createTaskScheduler(sc: SparkContext, masterURL: String): TaskScheduler = {
-    new TaskSchedulerImpl(sc)
+    new TaskSchedulerImpl(sc) {
+      val scheduler = this
+      val kubernetesClient: KubernetesClient = new DefaultKubernetesClient()
+      logDebug("Kubernetes TaskScheduler created")
+      override def createTaskSetManager(taskSet: TaskSet,
+                                        maxTaskFailures: Int
+                                       ): TaskSetManager = {
+        new TaskSetManager(sched = this, taskSet, maxTaskFailures) {
+
+          def getPendingTasksForHost(executorIP: String): ArrayBuffer[Int] = {
+            var pendingTasksforHost = pendingTasks.forHost.getOrElse(executorIP, ArrayBuffer())
+            if (pendingTasksforHost.nonEmpty) {
+              return pendingTasksforHost
+            }
+            val pod: Option[Pod] = this.getPodFromExecutorIP(executorIP)
+            if (pod.isEmpty) {
+              logDebug("Recieved NULL-Pod")
+              return emptyTasks
+            }
+            logDebug("Recieved Pod named: " + pod.get.getMetadata.getName)
+            val clusterNodeName = pod.get.getSpec.getNodeName
+            val clusterNodeIP = pod.get.getStatus.getHostIP
+            logDebug("Resolved Executor: " + pod.get.getMetadata.getName + " to Node: " +
+              clusterNodeName + " with Node-IP: " + clusterNodeIP)
+            pendingTasksforHost = pendingTasks.forHost.getOrElse(clusterNodeName, ArrayBuffer())
+            if (pendingTasksforHost.isEmpty) {
+              logDebug("Comparison with Nodename failed")
+              pendingTasksforHost = pendingTasks.forHost.getOrElse(clusterNodeIP, ArrayBuffer())
+            }
+            if (pendingTasksforHost.nonEmpty) {
+              logInfo(s"Got preferred task list $pendingTasks for executor host $executorIP" +
+                s" using cluster node $clusterNodeName at $clusterNodeIP")
+            }
+            pendingTasksforHost
+          }
+
+          override def dequeueTaskHelper(execId: String,
+                                         host: String,
+                                         maxLocality: TaskLocality.Value,
+                                         speculative: Boolean):
+          Option[(Int, TaskLocality.Value, Boolean)] = {
+            if (speculative && speculatableTasks.isEmpty) {
+              return None
+            }
+            val pendingTaskSetToUse = if (speculative) pendingSpeculatableTasks else pendingTasks
+            def dequeue(list: ArrayBuffer[Int]): Option[Int] = {
+              val task = this.dequeueTaskFromList(execId, host, list, speculative)
+              if (speculative && task.isDefined) {
+                speculatableTasks -= task.get
+              }
+              task
+            }
+
+            dequeue(pendingTaskSetToUse.forExecutor
+              .getOrElse(execId, ArrayBuffer())).foreach { index =>
+              return Some((index, TaskLocality.PROCESS_LOCAL, speculative))
+            }
+
+            if (TaskLocality.isAllowed(maxLocality, TaskLocality.NODE_LOCAL)) {
+              dequeue(getPendingTasksForHost(host)).foreach { index =>
+                return Some((index, TaskLocality.NODE_LOCAL, speculative))
+              }
+            }
+
+            // Look for noPref tasks after NODE_LOCAL for minimize cross-rack traffic
+            if (TaskLocality.isAllowed(maxLocality, TaskLocality.NO_PREF)) {
+              dequeue(pendingTaskSetToUse.noPrefs).foreach { index =>
+                return Some((index, TaskLocality.PROCESS_LOCAL, speculative))
+              }
+            }
+
+            if (TaskLocality.isAllowed(maxLocality, TaskLocality.RACK_LOCAL)) {
+              for {
+                rack <- scheduler.getRackForHost(host)
+                index <- dequeue(pendingTaskSetToUse.forRack.getOrElse(rack, ArrayBuffer()))
+              } {
+                return Some((index, TaskLocality.RACK_LOCAL, speculative))
+              }
+            }
+
+            if (TaskLocality.isAllowed(maxLocality, TaskLocality.ANY)) {
+              dequeue(pendingTaskSetToUse.all).foreach { index =>
+                return Some((index, TaskLocality.ANY, speculative))
+              }
+            }
+            None
+          }
+
+          override def addPendingTask(index: Int,
+                                      resolveRacks: Boolean = true,
+                                      speculatable: Boolean = false): Unit = {
+            // A zombie TaskSetManager may reach here while handling failed task.
+            if (isZombie) return
+            val pendingTaskSetToAddTo = if (speculatable) pendingSpeculatableTasks else pendingTasks
+            for (loc <- tasks(index).preferredLocations) {
+              loc match {
+                case e: ExecutorCacheTaskLocation =>
+                  pendingTaskSetToAddTo.forExecutor
+                    .getOrElseUpdate(e.executorId, new ArrayBuffer) += index
+                case e: HDFSCacheTaskLocation =>
+                  val exe = scheduler.getExecutorsAliveOnHost(loc.host)
+                  exe match {
+                    case Some(set) =>
+                      for (e <- set) {
+                        pendingTaskSetToAddTo.forExecutor
+                          .getOrElseUpdate(e, new ArrayBuffer) += index
+                      }
+                      logInfo(s"Pending task $index has a cached location at ${e.host} " +
+                        ", where there are executors " + set.mkString(","))
+                    case None => logDebug(s"Pending task $index has a" +
+                      " cached location at ${e.host} " +
+                      ", but there are no executors alive there.")
+                  }
+                case _ =>
+              }
+              var location: String = loc.host
+              if (InetAddresses.isInetAddress(loc.host)) {
+                location = this.getPodFromExecutorIP(loc.host).get.getSpec.getNodeName
+                logDebug("Found InetAdress as location: " + loc.host +
+                         " and resolved it to nodename: " + location)
+              } else {
+                location = loc.host.split("\\.")(0)
+                logDebug("Found netString as location: " + loc.host +
+                  " ** Resolved it to NodeName: " + location)
+              }
+              pendingTaskSetToAddTo.forHost.getOrElseUpdate(location, new ArrayBuffer) += index
+
+              if (resolveRacks) {
+                scheduler.getRackForHost(loc.host).foreach { rack =>
+                  pendingTaskSetToAddTo.forRack.getOrElseUpdate(rack, new ArrayBuffer) += index
+                }
+              }
+            }
+
+            if (tasks(index).preferredLocations == Nil) {
+              pendingTaskSetToAddTo.noPrefs += index
+            }
+
+            pendingTaskSetToAddTo.all += index
+          }
+          def getPodFromExecutorIP(podIP: String): Option[Pod] = {
+            logDebug("Requested to Resolve Pod with VIP: " + podIP)
+            val executor_pods: Seq[Pod] = kubernetesClient
+              .pods()
+              .withLabel(SPARK_APP_ID_LABEL, applicationId())
+              .withLabel(SPARK_ROLE_LABEL, SPARK_POD_EXECUTOR_ROLE)
+              .list().getItems().asScala
+            val podReturn = executor_pods.find(pod => pod.getStatus.getPodIP == podIP)
+            logDebug("Resolved Executor with VIP: " + podIP + " to "
+              + podReturn.get.getMetadata.getName)
+            podReturn
+          }
+        }
+      }
+    }
   }
 
   override def createSchedulerBackend(
