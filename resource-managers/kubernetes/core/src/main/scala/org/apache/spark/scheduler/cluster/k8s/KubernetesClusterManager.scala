@@ -185,6 +185,9 @@ private[spark] class KubernetesClusterManager extends ExternalClusterManager wit
           }
           def getPodFromExecutorIP(podIP: String): Option[Pod] = {
             logDebug("Requested to Resolve Pod with VIP: " + podIP)
+            clusterManager.kc = if (clusterManager.kc.isDefined) kc
+                                else Some(initializeKubernetesClient(sc, masterURL))
+
             val executor_pods: Seq[Pod] = clusterManager.kc.get
               .pods()
               .withLabel(SPARK_APP_ID_LABEL, applicationId())
@@ -204,28 +207,6 @@ private[spark] class KubernetesClusterManager extends ExternalClusterManager wit
       sc: SparkContext,
       masterURL: String,
       scheduler: TaskScheduler): SchedulerBackend = {
-    val wasSparkSubmittedInClusterMode = sc.conf.get(KUBERNETES_DRIVER_SUBMIT_CHECK)
-    val (authConfPrefix,
-      apiServerUri,
-      defaultServiceAccountToken,
-      defaultServiceAccountCaCrt) = if (wasSparkSubmittedInClusterMode) {
-      require(sc.conf.get(KUBERNETES_DRIVER_POD_NAME).isDefined,
-        "If the application is deployed using spark-submit in cluster mode, the driver pod name " +
-          "must be provided.")
-      val serviceAccountToken =
-        Some(new File(Config.KUBERNETES_SERVICE_ACCOUNT_TOKEN_PATH)).filter(_.exists)
-      val serviceAccountCaCrt =
-        Some(new File(Config.KUBERNETES_SERVICE_ACCOUNT_CA_CRT_PATH)).filter(_.exists)
-      (KUBERNETES_AUTH_DRIVER_MOUNTED_CONF_PREFIX,
-        sc.conf.get(KUBERNETES_DRIVER_MASTER_URL),
-        serviceAccountToken,
-        serviceAccountCaCrt)
-    } else {
-      (KUBERNETES_AUTH_CLIENT_MODE_PREFIX,
-        KubernetesUtils.parseMasterUrl(masterURL),
-        None,
-        None)
-    }
 
     // If KUBERNETES_EXECUTOR_POD_NAME_PREFIX is not set, initialize it so that all executors have
     // the same prefix. This is needed for client mode, where the feature steps code that sets this
@@ -238,14 +219,7 @@ private[spark] class KubernetesClusterManager extends ExternalClusterManager wit
         KubernetesConf.getResourceNamePrefix(sc.conf.get("spark.app.name")))
     }
 
-    this.kc = Option(SparkKubernetesClientFactory.createKubernetesClient(
-      apiServerUri,
-      Some(sc.conf.get(KUBERNETES_NAMESPACE)),
-      authConfPrefix,
-      SparkKubernetesClientFactory.ClientType.Driver,
-      sc.conf,
-      defaultServiceAccountToken,
-      defaultServiceAccountCaCrt))
+    this.kc = if (kc.isDefined) kc else Some(initializeKubernetesClient(sc, masterURL))
 
     if (sc.conf.get(KUBERNETES_EXECUTOR_PODTEMPLATE_FILE).isDefined) {
       KubernetesUtils.loadPodFromTemplate(
@@ -307,6 +281,40 @@ private[spark] class KubernetesClusterManager extends ExternalClusterManager wit
 
   override def initialize(scheduler: TaskScheduler, backend: SchedulerBackend): Unit = {
     scheduler.asInstanceOf[TaskSchedulerImpl].initialize(backend)
+  }
+
+  def initializeKubernetesClient(sc: SparkContext, masterURL: String): KubernetesClient = {
+
+    val (authConfPrefix,
+    apiServerUri,
+    defaultServiceAccountToken,
+    defaultServiceAccountCaCrt) = if (sc.conf.get(KUBERNETES_DRIVER_SUBMIT_CHECK)) {
+      require(sc.conf.get(KUBERNETES_DRIVER_POD_NAME).isDefined,
+        "If the application is deployed using spark-submit in cluster mode, the driver pod name " +
+          "must be provided.")
+      val serviceAccountToken =
+        Some(new File(Config.KUBERNETES_SERVICE_ACCOUNT_TOKEN_PATH)).filter(_.exists)
+      val serviceAccountCaCrt =
+        Some(new File(Config.KUBERNETES_SERVICE_ACCOUNT_CA_CRT_PATH)).filter(_.exists)
+      (KUBERNETES_AUTH_DRIVER_MOUNTED_CONF_PREFIX,
+        sc.conf.get(KUBERNETES_DRIVER_MASTER_URL),
+        serviceAccountToken,
+        serviceAccountCaCrt)
+    } else {
+      (KUBERNETES_AUTH_CLIENT_MODE_PREFIX,
+        KubernetesUtils.parseMasterUrl(masterURL),
+        None,
+        None)
+    }
+
+    SparkKubernetesClientFactory.createKubernetesClient(
+      apiServerUri,
+      Some(sc.conf.get(KUBERNETES_NAMESPACE)),
+      authConfPrefix,
+      SparkKubernetesClientFactory.ClientType.Driver,
+      sc.conf,
+      defaultServiceAccountToken,
+      defaultServiceAccountCaCrt)
   }
 
   var kc: Option[KubernetesClient] = None
