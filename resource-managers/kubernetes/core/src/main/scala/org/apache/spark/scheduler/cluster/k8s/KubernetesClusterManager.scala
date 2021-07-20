@@ -43,9 +43,9 @@ private[spark] class KubernetesClusterManager extends ExternalClusterManager wit
 
   override def createTaskScheduler(sc: SparkContext, masterURL: String): TaskScheduler = {
     val clusterManager = this
+
     new TaskSchedulerImpl(sc) {
       val scheduler = this
-
       logDebug("Kubernetes TaskScheduler created")
       override def createTaskSetManager(taskSet: TaskSet,
                                         maxTaskFailures: Int
@@ -185,10 +185,9 @@ private[spark] class KubernetesClusterManager extends ExternalClusterManager wit
           }
           def getPodFromExecutorIP(podIP: String): Option[Pod] = {
             logDebug("Requested to Resolve Pod with VIP: " + podIP)
-            clusterManager.kc = if (clusterManager.kc.isDefined) kc
-                                else Some(initializeKubernetesClient(sc, masterURL))
+            val kubernetesClient = clusterManager.getOrCreateKubernetesClient(sc, masterURL)
 
-            val executor_pods: Seq[Pod] = clusterManager.kc.get
+            val executor_pods: Seq[Pod] = kubernetesClient
               .pods()
               .withLabel(SPARK_APP_ID_LABEL, applicationId())
               .withLabel(SPARK_ROLE_LABEL, SPARK_POD_EXECUTOR_ROLE)
@@ -219,11 +218,11 @@ private[spark] class KubernetesClusterManager extends ExternalClusterManager wit
         KubernetesConf.getResourceNamePrefix(sc.conf.get("spark.app.name")))
     }
 
-    this.kc = if (kc.isDefined) kc else Some(initializeKubernetesClient(sc, masterURL))
+    val kubernetesClient = getOrCreateKubernetesClient(sc, masterURL)
 
     if (sc.conf.get(KUBERNETES_EXECUTOR_PODTEMPLATE_FILE).isDefined) {
       KubernetesUtils.loadPodFromTemplate(
-        this.kc.get,
+        kubernetesClient,
         new File(sc.conf.get(KUBERNETES_EXECUTOR_PODTEMPLATE_FILE).get),
         sc.conf.get(KUBERNETES_EXECUTOR_PODTEMPLATE_CONTAINER_NAME))
     }
@@ -246,7 +245,7 @@ private[spark] class KubernetesClusterManager extends ExternalClusterManager wit
       .build[java.lang.Long, java.lang.Long]()
     val executorPodsLifecycleEventHandler = new ExecutorPodsLifecycleManager(
       sc.conf,
-      this.kc.get,
+      kubernetesClient,
       snapshotsStore,
       removedExecutorsCache)
 
@@ -254,23 +253,23 @@ private[spark] class KubernetesClusterManager extends ExternalClusterManager wit
       sc.conf,
       sc.env.securityManager,
       new KubernetesExecutorBuilder(),
-      this.kc.get,
+      kubernetesClient,
       snapshotsStore,
       new SystemClock())
 
     val podsWatchEventSource = new ExecutorPodsWatchSnapshotSource(
       snapshotsStore,
-      this.kc.get)
+      kubernetesClient)
 
     val eventsPollingExecutor = ThreadUtils.newDaemonSingleThreadScheduledExecutor(
       "kubernetes-executor-pod-polling-sync")
     val podsPollingEventSource = new ExecutorPodsPollingSnapshotSource(
-      sc.conf, this.kc.get, snapshotsStore, eventsPollingExecutor)
+      sc.conf, kubernetesClient, snapshotsStore, eventsPollingExecutor)
 
     new KubernetesClusterSchedulerBackend(
       scheduler.asInstanceOf[TaskSchedulerImpl],
       sc,
-      this.kc.get,
+      kubernetesClient,
       schedulerExecutorService,
       snapshotsStore,
       executorPodsAllocator,
@@ -315,6 +314,17 @@ private[spark] class KubernetesClusterManager extends ExternalClusterManager wit
       sc.conf,
       defaultServiceAccountToken,
       defaultServiceAccountCaCrt)
+  }
+
+  def getOrCreateKubernetesClient(sc: SparkContext, masterURL: String): KubernetesClient = {
+    this.kc match {
+      case Some(client) =>
+        client
+      case None =>
+        val client = initializeKubernetesClient(sc, masterURL)
+        this.kc = Some(client)
+        client
+    }
   }
 
   var kc: Option[KubernetesClient] = None
