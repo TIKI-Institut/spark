@@ -25,7 +25,7 @@ import collection.JavaConverters._
 import com.google.common.cache.CacheBuilder
 import com.google.common.net.InetAddresses
 import io.fabric8.kubernetes.api.model.Pod
-import io.fabric8.kubernetes.client.{Config, DefaultKubernetesClient, KubernetesClient}
+import io.fabric8.kubernetes.client.{Config, KubernetesClient}
 
 import org.apache.spark.SparkContext
 import org.apache.spark.deploy.k8s.{KubernetesConf, KubernetesUtils, SparkKubernetesClientFactory}
@@ -42,9 +42,10 @@ private[spark] class KubernetesClusterManager extends ExternalClusterManager wit
   override def canCreate(masterURL: String): Boolean = masterURL.startsWith("k8s")
 
   override def createTaskScheduler(sc: SparkContext, masterURL: String): TaskScheduler = {
+    val clusterManager = this
     new TaskSchedulerImpl(sc) {
       val scheduler = this
-      val kubernetesClient: KubernetesClient = new DefaultKubernetesClient()
+
       logDebug("Kubernetes TaskScheduler created")
       override def createTaskSetManager(taskSet: TaskSet,
                                         maxTaskFailures: Int
@@ -184,7 +185,7 @@ private[spark] class KubernetesClusterManager extends ExternalClusterManager wit
           }
           def getPodFromExecutorIP(podIP: String): Option[Pod] = {
             logDebug("Requested to Resolve Pod with VIP: " + podIP)
-            val executor_pods: Seq[Pod] = kubernetesClient
+            val executor_pods: Seq[Pod] = clusterManager.kc.get
               .pods()
               .withLabel(SPARK_APP_ID_LABEL, applicationId())
               .withLabel(SPARK_ROLE_LABEL, SPARK_POD_EXECUTOR_ROLE)
@@ -237,18 +238,18 @@ private[spark] class KubernetesClusterManager extends ExternalClusterManager wit
         KubernetesConf.getResourceNamePrefix(sc.conf.get("spark.app.name")))
     }
 
-    val kubernetesClient = SparkKubernetesClientFactory.createKubernetesClient(
+    this.kc = Option(SparkKubernetesClientFactory.createKubernetesClient(
       apiServerUri,
       Some(sc.conf.get(KUBERNETES_NAMESPACE)),
       authConfPrefix,
       SparkKubernetesClientFactory.ClientType.Driver,
       sc.conf,
       defaultServiceAccountToken,
-      defaultServiceAccountCaCrt)
+      defaultServiceAccountCaCrt))
 
     if (sc.conf.get(KUBERNETES_EXECUTOR_PODTEMPLATE_FILE).isDefined) {
       KubernetesUtils.loadPodFromTemplate(
-        kubernetesClient,
+        this.kc.get,
         new File(sc.conf.get(KUBERNETES_EXECUTOR_PODTEMPLATE_FILE).get),
         sc.conf.get(KUBERNETES_EXECUTOR_PODTEMPLATE_CONTAINER_NAME))
     }
@@ -271,7 +272,7 @@ private[spark] class KubernetesClusterManager extends ExternalClusterManager wit
       .build[java.lang.Long, java.lang.Long]()
     val executorPodsLifecycleEventHandler = new ExecutorPodsLifecycleManager(
       sc.conf,
-      kubernetesClient,
+      this.kc.get,
       snapshotsStore,
       removedExecutorsCache)
 
@@ -279,23 +280,23 @@ private[spark] class KubernetesClusterManager extends ExternalClusterManager wit
       sc.conf,
       sc.env.securityManager,
       new KubernetesExecutorBuilder(),
-      kubernetesClient,
+      this.kc.get,
       snapshotsStore,
       new SystemClock())
 
     val podsWatchEventSource = new ExecutorPodsWatchSnapshotSource(
       snapshotsStore,
-      kubernetesClient)
+      this.kc.get)
 
     val eventsPollingExecutor = ThreadUtils.newDaemonSingleThreadScheduledExecutor(
       "kubernetes-executor-pod-polling-sync")
     val podsPollingEventSource = new ExecutorPodsPollingSnapshotSource(
-      sc.conf, kubernetesClient, snapshotsStore, eventsPollingExecutor)
+      sc.conf, this.kc.get, snapshotsStore, eventsPollingExecutor)
 
     new KubernetesClusterSchedulerBackend(
       scheduler.asInstanceOf[TaskSchedulerImpl],
       sc,
-      kubernetesClient,
+      this.kc.get,
       schedulerExecutorService,
       snapshotsStore,
       executorPodsAllocator,
@@ -307,4 +308,6 @@ private[spark] class KubernetesClusterManager extends ExternalClusterManager wit
   override def initialize(scheduler: TaskScheduler, backend: SchedulerBackend): Unit = {
     scheduler.asInstanceOf[TaskSchedulerImpl].initialize(backend)
   }
+
+  var kc: Option[KubernetesClient] = None
 }
