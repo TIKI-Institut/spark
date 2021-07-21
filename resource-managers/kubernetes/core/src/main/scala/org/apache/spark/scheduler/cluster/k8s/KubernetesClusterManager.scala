@@ -35,6 +35,13 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.scheduler.{ExecutorCacheTaskLocation, ExternalClusterManager, HDFSCacheTaskLocation, SchedulerBackend, TaskLocality, TaskScheduler, TaskSchedulerImpl, TaskSet, TaskSetManager}
 import org.apache.spark.util.{SystemClock, ThreadUtils}
 
+/**
+ * This is a patched KubernetesClusterManager for host based data locality.
+ * Host based data locality for the TIKI DSP Cluster works as follows:
+ * Some of the k8s kubelets have a HDFS Datanode,
+ * so we need to identify the Nodename on which the Executor Pods are spawned
+ * and need to ensure that this Nodename is used for Dispatching the tasks correctly.
+ */
 private[spark] class KubernetesClusterManager extends ExternalClusterManager with Logging {
 
   private def emptyTasks = ArrayBuffer.empty[Int]
